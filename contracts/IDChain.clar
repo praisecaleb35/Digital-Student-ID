@@ -12,10 +12,14 @@
 (define-constant ERR-ALREADY-REGISTERED-EVENT (err u106))
 (define-constant ERR-EVENT-FULL (err u107))
 (define-constant ERR-INVALID-DEPARTMENT (err u108))
+(define-constant ERR-CREDENTIAL-NOT-FOUND (err u109))
+(define-constant ERR-ALREADY-AWARDED (err u110))
+(define-constant ERR-CREDENTIAL-REVOKED (err u111))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var student-counter uint u0)
 (define-data-var event-counter uint u0)
+(define-data-var credential-counter uint u0)
 
 (define-map students
   { student-id: uint }
@@ -73,6 +77,27 @@
 (define-map department-admins
   { department: (string-ascii 32) }
   { admin: principal }
+)
+
+(define-map credentials
+  { credential-id: uint }
+  {
+    student-id: uint,
+    credential-type: (string-ascii 32),
+    title: (string-ascii 128),
+    description: (string-ascii 256),
+    issuer: principal,
+    issue-date: uint,
+    expiry-date: uint,
+    metadata: (string-ascii 256),
+    revoked: bool,
+    revoked-reason: (string-ascii 128)
+  }
+)
+
+(define-map student-credentials
+  { student-id: uint, credential-type: (string-ascii 32) }
+  { credential-count: uint }
 )
 
 (define-public (register-student 
@@ -330,4 +355,93 @@
 
 (define-read-only (get-department-admin (department (string-ascii 32)))
   (map-get? department-admins { department: department })
+)
+
+(define-public (issue-credential
+  (student-id uint)
+  (credential-type (string-ascii 32))
+  (title (string-ascii 128))
+  (description (string-ascii 256))
+  (expiry-blocks uint)
+  (metadata (string-ascii 256))
+)
+  (let
+    (
+      (student-data (unwrap! (map-get? students { student-id: student-id }) ERR-STUDENT-NOT-FOUND))
+      (new-credential-id (+ (var-get credential-counter) u1))
+      (expiry-date (if (> expiry-blocks u0) (+ stacks-block-height expiry-blocks) u0))
+      (current-count (default-to { credential-count: u0 } (map-get? student-credentials { student-id: student-id, credential-type: credential-type })))
+    )
+    (asserts! (or
+      (is-eq tx-sender (var-get contract-owner))
+      (is-eq tx-sender (default-to tx-sender (get admin (map-get? department-admins { department: (get department student-data) }))))
+    ) ERR-UNAUTHORIZED)
+    (asserts! (is-eq (get status student-data) "active") ERR-INVALID-STATUS)
+    (map-set credentials
+      { credential-id: new-credential-id }
+      {
+        student-id: student-id,
+        credential-type: credential-type,
+        title: title,
+        description: description,
+        issuer: tx-sender,
+        issue-date: stacks-block-height,
+        expiry-date: expiry-date,
+        metadata: metadata,
+        revoked: false,
+        revoked-reason: ""
+      }
+    )
+    (map-set student-credentials
+      { student-id: student-id, credential-type: credential-type }
+      { credential-count: (+ (get credential-count current-count) u1) }
+    )
+    (var-set credential-counter new-credential-id)
+    (ok new-credential-id)
+  )
+)
+
+(define-public (revoke-credential (credential-id uint) (reason (string-ascii 128)))
+  (let
+    (
+      (credential-data (unwrap! (map-get? credentials { credential-id: credential-id }) ERR-CREDENTIAL-NOT-FOUND))
+      (student-data (unwrap! (map-get? students { student-id: (get student-id credential-data) }) ERR-STUDENT-NOT-FOUND))
+    )
+    (asserts! (or
+      (is-eq tx-sender (var-get contract-owner))
+      (is-eq tx-sender (get issuer credential-data))
+      (is-eq tx-sender (default-to tx-sender (get admin (map-get? department-admins { department: (get department student-data) }))))
+    ) ERR-UNAUTHORIZED)
+    (asserts! (not (get revoked credential-data)) ERR-CREDENTIAL-REVOKED)
+    (map-set credentials
+      { credential-id: credential-id }
+      (merge credential-data { revoked: true, revoked-reason: reason })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-credential (credential-id uint))
+  (map-get? credentials { credential-id: credential-id })
+)
+
+(define-read-only (verify-credential (credential-id uint))
+  (match (map-get? credentials { credential-id: credential-id })
+    credential-data (ok (and
+      (not (get revoked credential-data))
+      (or
+        (is-eq (get expiry-date credential-data) u0)
+        (> (get expiry-date credential-data) stacks-block-height)
+      )
+    ))
+    (err false)
+  )
+)
+
+(define-read-only (get-student-credential-count (student-id uint) (credential-type (string-ascii 32)))
+  (default-to { credential-count: u0 } (map-get? student-credentials { student-id: student-id, credential-type: credential-type }))
+)
+
+(define-read-only (get-total-credentials)
+  (var-get credential-counter)
 )
